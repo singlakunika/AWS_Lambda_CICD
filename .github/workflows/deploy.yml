@@ -28,13 +28,13 @@ jobs:
             echo "LOG_LEVEL=DEBUG" >> $GITHUB_ENV
           fi
 
-      # 3️⃣ Install basic utilities
+      # 3️⃣ Install host-side tools
       - name: Install packaging tools
         run: |
           sudo apt-get update
           sudo apt-get install -y zip unzip
 
-      # 4️⃣ Package Lambda dependencies inside the AWS Lambda Python 3.11 Docker image
+      # 4️⃣ Build Python dependencies inside the Lambda base image (Amazon Linux)
       - name: Package Lambda Function on Amazon Linux (x86_64)
         run: |
           set -euo pipefail
@@ -42,6 +42,7 @@ jobs:
 
           rm -rf build package python deps.zip ../lambda.zip || true
 
+          # ✅ Build dependencies in Lambda environment
           docker run --rm \
             --platform linux/amd64 \
             --entrypoint /bin/bash \
@@ -52,28 +53,28 @@ jobs:
               yum install -y zip >/dev/null
               python -m pip install --upgrade pip
               mkdir -p python
-              # install pandas, requests and their dependencies using binary wheels
-              pip install --root-user-action=ignore --only-binary=:all: -r requirements.txt -t python
+              # Install pandas + requests + numpy with binary wheels
+              pip install --root-user-action=ignore --only-binary=:all: pandas requests numpy -t python
               cd /var/task
-              zip -r ../deps.zip python
+              zip -r ../deps.zip python >/dev/null
             "
 
-          # Combine dependencies + Lambda handler
+          # Combine dependencies + your Lambda handler
           mkdir -p package
           unzip -q ../deps.zip -d package
           cp app.py package/
 
-          # Move dependencies to root (important for Lambda)
+          # Move dependencies to the root for Lambda to import
           if [ -d "package/python" ]; then
             mv package/python/* package/
             rm -rf package/python
           fi
 
           cd package
-          zip -r ../../lambda.zip .
+          zip -r ../../lambda.zip . >/dev/null
           cd ../..
 
-      # 5️⃣ Configure AWS credentials (secure from GitHub Secrets)
+      # 5️⃣ Configure AWS credentials securely
       - name: Configure AWS credentials
         uses: aws-actions/configure-aws-credentials@v4
         with:
@@ -81,7 +82,7 @@ jobs:
           aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
           aws-region: us-east-1
 
-      # 6️⃣ Deploy to AWS Lambda
+      # 6️⃣ Deploy Lambda to AWS
       - name: Deploy to AWS Lambda
         env:
           REGION: us-east-1
@@ -90,10 +91,10 @@ jobs:
           FUNCTION_NAME="cicd_lambda_${{ github.ref_name }}"
           ENV_VARS="Variables={ENV=${{ env.ENV }},API_KEY=${{ env.API_KEY }},LOG_LEVEL=${{ env.LOG_LEVEL }}}"
 
-          echo "Deploying Lambda function: $FUNCTION_NAME in $REGION"
+          echo "Deploying Lambda function: $FUNCTION_NAME"
 
           if ! aws lambda get-function --function-name "$FUNCTION_NAME" --region "$REGION" >/dev/null 2>&1; then
-            echo "Creating new function: $FUNCTION_NAME ..."
+            echo "Creating new Lambda function..."
             aws lambda create-function \
               --function-name "$FUNCTION_NAME" \
               --runtime python3.11 \
@@ -105,16 +106,14 @@ jobs:
               --region "$REGION" \
               --environment "$ENV_VARS"
 
-            echo "Waiting for Lambda creation to finish..."
             aws lambda wait function-active --function-name "$FUNCTION_NAME" --region "$REGION"
           else
-            echo "Updating code for existing function: $FUNCTION_NAME ..."
+            echo "Updating existing Lambda code..."
             aws lambda update-function-code \
               --function-name "$FUNCTION_NAME" \
               --zip-file fileb://lambda.zip \
               --region "$REGION" >/dev/null
 
-            echo "Waiting for code update..."
             aws lambda wait function-updated --function-name "$FUNCTION_NAME" --region "$REGION"
 
             echo "Updating configuration..."
@@ -123,6 +122,5 @@ jobs:
               --environment "$ENV_VARS" \
               --region "$REGION" >/dev/null
 
-            echo "Waiting for configuration update..."
             aws lambda wait function-updated --function-name "$FUNCTION_NAME" --region "$REGION"
           fi
