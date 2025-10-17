@@ -28,13 +28,13 @@ jobs:
             echo "LOG_LEVEL=DEBUG" >> $GITHUB_ENV
           fi
 
-      # 3️⃣ Install host-side tools
+      # 3️⃣ Install required host utilities
       - name: Install packaging tools
         run: |
           sudo apt-get update
           sudo apt-get install -y zip unzip
 
-      # 4️⃣ Build Python dependencies inside the Lambda base image (Amazon Linux)
+      # 4️⃣ Package Lambda Function inside the official AWS Lambda base image (Amazon Linux)
       - name: Package Lambda Function on Amazon Linux (x86_64)
         run: |
           set -euo pipefail
@@ -42,39 +42,43 @@ jobs:
 
           rm -rf build package python deps.zip ../lambda.zip || true
 
-          # ✅ Build dependencies in Lambda environment
+          # ✅ Build dependencies inside the Lambda base image (Amazon Linux 2023)
           docker run --rm \
             --platform linux/amd64 \
             --entrypoint /bin/bash \
             -v "$PWD":/var/task \
+            -w /var/task \
             public.ecr.aws/lambda/python:3.11 \
             -lc "
               set -e
               yum install -y zip >/dev/null
               python -m pip install --upgrade pip
               mkdir -p python
-              # Install pandas + requests + numpy with binary wheels
+              # Install binary wheels for pandas, numpy, requests
               pip install --root-user-action=ignore --only-binary=:all: pandas requests numpy -t python
-              cd /var/task
-              zip -r ../deps.zip python >/dev/null
+              # ✅ Create deps.zip inside /var/task (not outside)
+              zip -r deps.zip python >/dev/null
+              ls -la deps.zip
             "
 
-          # Combine dependencies + your Lambda handler
+          # ✅ Use deps.zip created inside the mounted volume
+          test -f deps.zip
           mkdir -p package
-          unzip -q ../deps.zip -d package
+          unzip -q deps.zip -d package
           cp app.py package/
 
-          # Move dependencies to the root for Lambda to import
+          # ✅ Move dependencies to zip root (required for Lambda import)
           if [ -d "package/python" ]; then
             mv package/python/* package/
             rm -rf package/python
           fi
 
+          # ✅ Create the final lambda.zip
           cd package
-          zip -r deps.zip python >/dev/null
+          zip -r ../../lambda.zip . >/dev/null
           cd ../..
 
-      # 5️⃣ Configure AWS credentials securely
+      # 5️⃣ Configure AWS credentials from GitHub Secrets
       - name: Configure AWS credentials
         uses: aws-actions/configure-aws-credentials@v4
         with:
@@ -82,7 +86,7 @@ jobs:
           aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
           aws-region: us-east-1
 
-      # 6️⃣ Deploy Lambda to AWS
+      # 6️⃣ Deploy to AWS Lambda
       - name: Deploy to AWS Lambda
         env:
           REGION: us-east-1
@@ -91,7 +95,7 @@ jobs:
           FUNCTION_NAME="cicd_lambda_${{ github.ref_name }}"
           ENV_VARS="Variables={ENV=${{ env.ENV }},API_KEY=${{ env.API_KEY }},LOG_LEVEL=${{ env.LOG_LEVEL }}}"
 
-          echo "Deploying Lambda function: $FUNCTION_NAME"
+          echo "Deploying Lambda function: $FUNCTION_NAME in $REGION"
 
           if ! aws lambda get-function --function-name "$FUNCTION_NAME" --region "$REGION" >/dev/null 2>&1; then
             echo "Creating new Lambda function..."
@@ -108,7 +112,7 @@ jobs:
 
             aws lambda wait function-active --function-name "$FUNCTION_NAME" --region "$REGION"
           else
-            echo "Updating existing Lambda code..."
+            echo "Updating existing Lambda function..."
             aws lambda update-function-code \
               --function-name "$FUNCTION_NAME" \
               --zip-file fileb://lambda.zip \
