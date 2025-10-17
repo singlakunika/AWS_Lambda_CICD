@@ -43,7 +43,7 @@ jobs:
         mkdir package
 
         # ✅ Build dependencies inside Lambda-compatible Docker
-        docker run --rm -v $PWD:/var/task public.ecr.aws/lambda/python:3.11 bash -c "
+        docker run --rm -v $PWD:/var/task lambci/lambda:build-python3.11 bash -c "
           pip install --upgrade pip
           pip install --no-cache-dir -r requirements.txt -t /var/task/package
         "
