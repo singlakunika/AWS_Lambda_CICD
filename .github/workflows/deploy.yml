@@ -71,7 +71,7 @@ jobs:
           fi
 
           cd package
-          zip -r ../../lambda.zip . >/dev/null
+          zip -r deps.zip python >/dev/null
           cd ../..
 
       # 5️⃣ Configure AWS credentials securely
