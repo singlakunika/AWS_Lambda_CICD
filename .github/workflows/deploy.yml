@@ -19,10 +19,12 @@ jobs:
       with:
         python-version: '3.11'
 
-    - name: Install required utilities
+    - name: Install dependencies
       run: |
         sudo apt-get update
         sudo apt-get install -y jq zip
+        pip install --upgrade pip
+        pip install boto3
 
     - name: Set environment variables
       id: set-env-vars
@@ -40,21 +42,19 @@ jobs:
     - name: Package Lambda Function
       run: |
         cd lambda_function
+        python3.11 -m venv venv
+        source venv/bin/activate
         mkdir package
-
-        # ✅ Build dependencies inside Lambda-compatible Docker
-        docker run --rm -v $PWD:/var/task lambci/lambda:build-python3.11 bash -c "
-          pip install --upgrade pip
-          pip install --no-cache-dir -r requirements.txt -t /var/task/package
-        "
-
-        # Copy app.py into package
+        pip install --no-cache-dir -r requirements.txt -t ./package
         cp app.py ./package/
-
-        # Zip the package
         cd package
         zip -r ../../lambda.zip .
         cd ../..
+
+    - name: Build Docker Image for Lambda
+      run: |
+        docker build -t lambda-function .
+        docker tag lambda-function:latest 123456789012.dkr.ecr.us-east-1.amazonaws.com/lambda-function:latest
 
     - name: Deploy to AWS Lambda
       env:
