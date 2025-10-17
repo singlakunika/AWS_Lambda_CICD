@@ -14,7 +14,7 @@ jobs:
       - name: Checkout code
         uses: actions/checkout@v3
 
-      # Decide env vars based on branch
+      # Set environment variables depending on the branch
       - name: Set environment variables
         run: |
           if [[ "${{ github.ref_name }}" == "main" ]]; then
@@ -32,8 +32,9 @@ jobs:
           sudo apt-get update
           sudo apt-get install -y zip unzip
 
-      # Build dependencies in the Lambda base image so NumPy & friends match AL2023
-      # If your Lambda uses ARM/Graviton, switch --platform to linux/arm64 and set --architecture arm64 below.
+      # ✅ Build dependencies inside the official AWS Lambda Python 3.11 image
+      # This ensures binary compatibility with Amazon Linux 2023
+      # If your Lambda is arm64, change --platform to linux/arm64 and architecture below
       - name: Package Lambda Function on Amazon Linux (x86_64)
         run: |
           set -euo pipefail
@@ -43,19 +44,20 @@ jobs:
 
           docker run --rm \
             --platform linux/amd64 \
+            --entrypoint /bin/bash \
             -v "$PWD":/var/task \
             public.ecr.aws/lambda/python:3.11 \
-            /bin/bash -lc "
+            -lc "
               set -e
               python -m pip install --upgrade pip
               mkdir -p python
-              # Use binary wheels only to avoid pulling source trees
+              # Use binary wheels only to avoid building from source (faster, smaller)
               pip install --only-binary=:all: -r requirements.txt -t python
               cd /var/task
               zip -r ../deps.zip python
             "
 
-          # Create final deployment zip with deps at root + your handler file(s)
+          # Combine dependencies + your Lambda handler
           mkdir -p package
           unzip -q ../deps.zip -d package
           cp app.py package/
@@ -64,7 +66,7 @@ jobs:
           zip -r ../../lambda.zip .
           cd ../..
 
-      # Configure AWS credentials (recommended)
+      # ✅ Configure AWS credentials using the official GitHub Action
       - name: Configure AWS credentials
         uses: aws-actions/configure-aws-credentials@v4
         with:
@@ -72,6 +74,7 @@ jobs:
           aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
           aws-region: us-east-1
 
+      # ✅ Deploy to AWS Lambda
       - name: Deploy to AWS Lambda
         env:
           REGION: us-east-1
@@ -80,10 +83,10 @@ jobs:
           FUNCTION_NAME="cicd_lambda_${{ github.ref_name }}"
           ENV_VARS="Variables={ENV=${{ env.ENV }},API_KEY=${{ env.API_KEY }},LOG_LEVEL=${{ env.LOG_LEVEL }}}"
 
-          echo "Deploying to Lambda function: $FUNCTION_NAME in $REGION"
+          echo "Deploying Lambda function: $FUNCTION_NAME in $REGION"
 
           if ! aws lambda get-function --function-name "$FUNCTION_NAME" --region "$REGION" >/dev/null 2>&1; then
-            echo "Creating $FUNCTION_NAME..."
+            echo "Creating new function: $FUNCTION_NAME ..."
             aws lambda create-function \
               --function-name "$FUNCTION_NAME" \
               --runtime python3.11 \
@@ -95,10 +98,10 @@ jobs:
               --region "$REGION" \
               --environment "$ENV_VARS"
 
-            echo "Waiting for creation to finish..."
+            echo "Waiting for Lambda creation to finish..."
             aws lambda wait function-active --function-name "$FUNCTION_NAME" --region "$REGION"
           else
-            echo "Updating code for $FUNCTION_NAME..."
+            echo "Updating code for existing function: $FUNCTION_NAME ..."
             aws lambda update-function-code \
               --function-name "$FUNCTION_NAME" \
               --zip-file fileb://lambda.zip \
