@@ -11,92 +11,120 @@ jobs:
     runs-on: ubuntu-latest
 
     steps:
-    - name: Checkout code
-      uses: actions/checkout@v3
+      # 1️⃣ Checkout the repository
+      - name: Checkout code
+        uses: actions/checkout@v3
 
-    - name: Install dependencies
-      run: |
-        sudo apt-get update
-        sudo apt-get install -y python3.11 python3.11-venv python3-pip jq zip
-        pip3 install boto3
+      # 2️⃣ Set environment variables based on branch
+      - name: Set environment variables
+        run: |
+          if [[ "${{ github.ref_name }}" == "main" ]]; then
+            echo "ENV=prod" >> $GITHUB_ENV
+            echo "API_KEY=prod_api_key" >> $GITHUB_ENV
+            echo "LOG_LEVEL=INFO" >> $GITHUB_ENV
+          else
+            echo "ENV=test" >> $GITHUB_ENV
+            echo "API_KEY=test_api_key" >> $GITHUB_ENV
+            echo "LOG_LEVEL=DEBUG" >> $GITHUB_ENV
+          fi
 
-    - name: Set environment variables
-      id: set-env-vars
-      run: |
-        if [[ "${{ github.ref_name }}" == "main" ]]; then
-          echo "ENV=prod" >> $GITHUB_ENV
-          echo "API_KEY=prod_api_key" >> $GITHUB_ENV
-          echo "LOG_LEVEL=INFO" >> $GITHUB_ENV
-        else
-          echo "ENV=test" >> $GITHUB_ENV
-          echo "API_KEY=test_api_key" >> $GITHUB_ENV
-          echo "LOG_LEVEL=DEBUG" >> $GITHUB_ENV
-        fi
+      # 3️⃣ Install required host utilities
+      - name: Install packaging tools
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y zip unzip
 
-    - name: Package Lambda Function
-      run: |
-        cd lambda_function
-        python3.11 -m venv venv
-        source venv/bin/activate
-        mkdir package
-        pip install --no-cache-dir -r requirements.txt -t ./package
-        cp app.py ./package/
-        cd package
-        zip -r ../../lambda.zip .
-        cd ../..
+      # 4️⃣ Package Lambda Function inside the official AWS Lambda base image (Amazon Linux)
+      - name: Package Lambda Function on Amazon Linux (x86_64)
+        run: |
+          set -euo pipefail
+          cd lambda_function
 
-    - name: Deploy to AWS Lambda
-      env:
-        AWS_ACCESS_KEY_ID: ${{ secrets.AWS_ACCESS_KEY_ID }}
-        AWS_SECRET_ACCESS_KEY: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
-        AWS_DEFAULT_REGION: us-east-1
-      run: |
-        FUNCTION_NAME="cicd_lambda_${{ github.ref_name }}"
-        REGION="us-east-1"
-        echo "Deploying to Lambda function: $FUNCTION_NAME"
+          rm -rf build package python deps.zip ../lambda.zip || true
 
-        # Check if the Lambda function exists
-        FUNCTION_EXISTS=$(aws lambda get-function --function-name $FUNCTION_NAME --region $REGION || echo "false")
+          # ✅ Build dependencies inside the Lambda base image (Amazon Linux 2023)
+          docker run --rm \
+            --platform linux/amd64 \
+            --entrypoint /bin/bash \
+            -v "$PWD":/var/task \
+            -w /var/task \
+            public.ecr.aws/lambda/python:3.11 \
+            -lc "
+              set -e
+              yum install -y zip >/dev/null
+              python -m pip install --upgrade pip
+              mkdir -p python
+              # Install binary wheels for pandas, numpy, requests
+              pip install --root-user-action=ignore --only-binary=:all: pandas requests numpy -t python
+              # ✅ Create deps.zip inside /var/task (not outside)
+              zip -r deps.zip python >/dev/null
+              ls -la deps.zip
+            "
 
-        ENV_VARS="Variables={ENV=${{ env.ENV }},API_KEY=${{ env.API_KEY }},LOG_LEVEL=${{ env.LOG_LEVEL }}}"
+          # ✅ Use deps.zip created inside the mounted volume
+          test -f deps.zip
+          mkdir -p package
+          unzip -q deps.zip -d package
+          cp app.py package/
 
-        if [ "$FUNCTION_EXISTS" == "false" ]; then
-          echo "Creating Lambda function $FUNCTION_NAME..."
-          aws lambda create-function \
-            --function-name $FUNCTION_NAME \
-            --runtime python3.11 \
-            --role arn:aws:iam::851725469799:role/service-role/test_function-role-k06sk5ka \
-            --handler app.lambda_handler \
-            --timeout 300 \
-            --zip-file fileb://lambda.zip \
-            --region $REGION \
-            --environment "$ENV_VARS"
-        else
-          echo "Updating Lambda function $FUNCTION_NAME..."
-          aws lambda update-function-code \
-            --function-name $FUNCTION_NAME \
-            --region $REGION \
-            --zip-file fileb://lambda.zip
+          # ✅ Move dependencies to zip root (required for Lambda import)
+          if [ -d "package/python" ]; then
+            mv package/python/* package/
+            rm -rf package/python
+          fi
 
-          # Wait for function code update to complete
-          echo "Waiting for function code update to complete..."
-          while true; do
-            UPDATE_STATUS=$(aws lambda get-function --function-name $FUNCTION_NAME --region $REGION --query 'Configuration.LastUpdateStatus' --output text)
-            if [ "$UPDATE_STATUS" == "Successful" ]; then
-              echo "Function code update completed successfully."
-              break
-            elif [ "$UPDATE_STATUS" == "Failed" ]; then
-              echo "Function code update failed."
-              exit 1
-            else
-              echo "Update in progress, waiting..."
-              sleep 5
-            fi
-          done
+          # ✅ Create the final lambda.zip
+          cd package
+          zip -r ../../lambda.zip . >/dev/null
+          cd ../..
 
-          # Update function configuration
-          aws lambda update-function-configuration \
-            --function-name $FUNCTION_NAME \
-            --region $REGION \
-            --environment "$ENV_VARS"
-        fi
+      # 5️⃣ Configure AWS credentials from GitHub Secrets
+      - name: Configure AWS credentials
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          aws-access-key-id: ${{ secrets.AWS_ACCESS_KEY_ID }}
+          aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+          aws-region: us-east-1
+
+      # 6️⃣ Deploy to AWS Lambda
+      - name: Deploy to AWS Lambda
+        env:
+          REGION: us-east-1
+        run: |
+          set -euo pipefail
+          FUNCTION_NAME="cicd_lambda_${{ github.ref_name }}"
+          ENV_VARS="Variables={ENV=${{ env.ENV }},API_KEY=${{ env.API_KEY }},LOG_LEVEL=${{ env.LOG_LEVEL }}}"
+
+          echo "Deploying Lambda function: $FUNCTION_NAME in $REGION"
+
+          if ! aws lambda get-function --function-name "$FUNCTION_NAME" --region "$REGION" >/dev/null 2>&1; then
+            echo "Creating new Lambda function..."
+            aws lambda create-function \
+              --function-name "$FUNCTION_NAME" \
+              --runtime python3.11 \
+              --architecture x86_64 \
+              --role arn:aws:iam::114498380988:role/test_lambda_dev \
+              --handler app.lambda_handler \
+              --timeout 300 \
+              --zip-file fileb://lambda.zip \
+              --region "$REGION" \
+              --environment "$ENV_VARS"
+
+            aws lambda wait function-active --function-name "$FUNCTION_NAME" --region "$REGION"
+          else
+            echo "Updating existing Lambda function..."
+            aws lambda update-function-code \
+              --function-name "$FUNCTION_NAME" \
+              --zip-file fileb://lambda.zip \
+              --region "$REGION" >/dev/null
+
+            aws lambda wait function-updated --function-name "$FUNCTION_NAME" --region "$REGION"
+
+            echo "Updating configuration..."
+            aws lambda update-function-configuration \
+              --function-name "$FUNCTION_NAME" \
+              --environment "$ENV_VARS" \
+              --region "$REGION" >/dev/null
+
+            aws lambda wait function-updated --function-name "$FUNCTION_NAME" --region "$REGION"
+          fi
