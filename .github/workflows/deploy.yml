@@ -22,7 +22,7 @@ jobs:
     - name: Install required utilities
       run: |
         sudo apt-get update
-        sudo apt-get install -y jq zip
+        sudo apt-get install -y jq zip docker.io
 
     - name: Set environment variables
       id: set-env-vars
@@ -42,14 +42,16 @@ jobs:
         cd lambda_function
         mkdir package
 
-        # ✅ Install dependencies directly into package folder
-        pip install --upgrade pip
-        pip install --no-cache-dir -r requirements.txt -t ./package
+        # ✅ Build dependencies inside Lambda-compatible Docker
+        docker run --rm -v $PWD:/var/task public.ecr.aws/lambda/python:3.11 bash -c "
+          pip install --upgrade pip
+          pip install --no-cache-dir -r requirements.txt -t /var/task/package
+        "
 
-        # ✅ Copy app.py into package
+        # Copy app.py into package
         cp app.py ./package/
 
-        # ✅ Zip the package
+        # Zip the package
         cd package
         zip -r ../../lambda.zip .
         cd ../..
